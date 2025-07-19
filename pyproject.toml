@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tinywifi"
+version = "0.1.0"
+description = "Simple python based command line WiFi signal analysis tool."
+authors = [
+    { name = "Jason Cox", email = "jason@jasonacox.com" }
+]
+readme = "README.md"
+requires-python = ">=3.7"
+dependencies = [
+    "colorama"
+]
+
+[project.urls]
+Homepage = "https://github.com/jasonacox/tinywifi"
+
+[project.scripts]
+tinywifi = "tinywifi.cli:main"
