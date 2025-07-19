@@ -407,16 +407,21 @@ def print_table(networks_dict, current_id=None):
     ssid_list = [k for k in networks_dict.keys() if k != 'current']
     ssid_list.sort(key=lambda k: networks_dict[k].get('rssi', -100), reverse=True)
 
+    import platform
+    sys_os = platform.system().lower()
     for unique_id in ssid_list:
         net = networks_dict[unique_id]
         signal_val = net.get('signal')
         rssi = net.get('rssi', -100)
-        # Compose signal display: percent + RSSI
+        # Compose signal display: show % for Linux, % + dB for macOS
         if signal_val is not None and isinstance(signal_val, int) and 0 <= signal_val <= 100:
             color = (
-                Fore.GREEN if rssi > -60 else (Fore.YELLOW if rssi > -80 else Fore.RED)
+                Fore.GREEN if signal_val > 60 else (Fore.YELLOW if signal_val > 40 else Fore.RED)
             )
-            signal_display = f"{signal_val}% ({rssi} dB)"
+            if sys_os == "linux":
+                signal_display = f"{signal_val}%"
+            else:
+                signal_display = f"{signal_val}% ({rssi} dB)"
         else:
             color = (
                 Fore.GREEN if rssi > -60 else (Fore.YELLOW if rssi > -80 else Fore.RED)
