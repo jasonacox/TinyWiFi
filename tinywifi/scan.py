@@ -164,6 +164,7 @@ def get_wifi_networks(timeout=5, os="macos"):
     elif os == "linux":
         # Linux logic using nmcli
         import os
+        import codecs
         connected_unique_id = None
         for i in range(scans):
             try:
@@ -180,19 +181,21 @@ def get_wifi_networks(timeout=5, os="macos"):
                     check=True,
                 )
                 for line in scan_result.stdout.splitlines():
+                    # Remove trailing backslashes and decode escape sequences
+                    line = line.replace('\\', '').encode('utf-8').decode('unicode_escape')
                     fields = line.strip().split(":")
                     if len(fields) >= 9:
-                        active = fields[0]
-                        ssid = fields[1]
+                        active = fields[0].strip()
+                        ssid = fields[1].strip()
                         if not ssid:
                             ssid = "<hidden>"  # empty SSID
-                        bssid = fields[2]
+                        bssid = fields[2].strip()
                         signal = int(fields[3]) if fields[3].isdigit() else -100
-                        channel = fields[4]
-                        freq = fields[5].replace(" MHz","")
-                        mode = fields[6]
-                        rate = fields[7]
-                        security = fields[8]
+                        channel = fields[4].strip()
+                        freq = fields[5].replace(" MHz","").strip()
+                        mode = fields[6].strip()
+                        rate = fields[7].strip()
+                        security = fields[8].strip()
                         band = "2.4GHz" if freq and freq.startswith("2") else "5GHz"
                         unique_id = f"{ssid}_{freq}"
                         all_networks[unique_id] = {
