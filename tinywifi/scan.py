@@ -180,10 +180,13 @@ def get_wifi_networks(timeout=5, os="macos"):
                     text=True,
                     check=True,
                 )
+                import re
                 for line in scan_result.stdout.splitlines():
-                    # Remove trailing backslashes and decode escape sequences
-                    line = line.replace('\\', '').encode('utf-8').decode('unicode_escape')
-                    fields = line.strip().split(":")
+                    # nmcli escapes colons in BSSID and other fields as \:
+                    # Split only on unescaped colons
+                    fields = re.split(r'(?<!\\):', line.strip())
+                    # Unescape colons in fields
+                    fields = [f.replace('\\:', ':').replace('\\', '') for f in fields]
                     if len(fields) >= 9:
                         active = fields[0].strip()
                         ssid = fields[1].strip()
