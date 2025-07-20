@@ -24,18 +24,19 @@ from colorama import Fore, Style, init
 
 init(autoreset=True)
 
-def get_wifi_networks(timeout=5, os="macos"):
+def get_wifi_networks(timeout=5, target_os="macos"):
     """
     Scan for WiFi networks and return a dict of unique networks keyed by SSID+freq, and the unique_id of the currently connected SSID.
     Args:
         timeout (int): Total time in seconds to scan (multiple scans).
+        target_os (str): Target operating system ("macos", "linux", "windows").
     Returns:
         Tuple[Dict[str, dict], str]: Dict of network info keyed by unique_id ("SSID_freq"), and the connected unique_id (or None).
     """
     all_networks = {}
     scans = max(1, timeout // 2)
     connected_unique_id = None
-    if os == "macos":
+    if target_os == "macos":
         # macOS logic using system_profiler SPAirPortDataType
         for i in range(scans):
             try:
@@ -72,7 +73,7 @@ def get_wifi_networks(timeout=5, os="macos"):
                 
         all_networks['current'] = connected_unique_id
         return all_networks
-    elif os == "linux":
+    elif target_os == "linux":
         # Linux logic using nmcli
         connected_unique_id = None
         for i in range(scans):
@@ -89,6 +90,7 @@ def get_wifi_networks(timeout=5, os="macos"):
                     text=True,
                     check=True,
                 )
+                print(f"nmcli output: {scan_result.stdout[:200]}...")  # Debug output
                 for line in scan_result.stdout.splitlines():
                     # nmcli escapes colons in BSSID and other fields as \:
                     # Split only on unescaped colons
@@ -108,11 +110,16 @@ def get_wifi_networks(timeout=5, os="macos"):
                         rate = fields[7].strip()
                         security = fields[8].strip()
                         band = "2.4GHz" if freq and freq.startswith("2") else "5GHz"
+                        
+                        # Calculate signal percentage for Linux (nmcli gives percentage directly)
+                        signal_percent = signal if signal > 0 else 0
+                        
                         unique_id = f"{ssid}_{freq}"
                         all_networks[unique_id] = {
                             "ssid": ssid,
                             "bssid": bssid,
                             "rssi": signal,
+                            "signal": signal_percent,
                             "channel": channel,
                             "freq": freq,
                             "band": band,
@@ -128,11 +135,11 @@ def get_wifi_networks(timeout=5, os="macos"):
                 time.sleep(2)
         all_networks['current'] = connected_unique_id
         return all_networks
-    elif os == "windows":
+    elif target_os == "windows":
         # Windows logic (placeholder)
         raise NotImplementedError("Windows WiFi scanning not implemented yet.")
     else:
-        raise ValueError(f"Unknown OS: {os}")
+        raise ValueError(f"Unknown OS: {target_os}")
 
 def scan(timeout=5):
     """
@@ -156,7 +163,7 @@ def scan(timeout=5):
     else:
         print(f"{Fore.RED}Unsupported OS: {sys_os}{Style.RESET_ALL}")
         return []
-    networks_dict = get_wifi_networks(timeout, os=os_arg)
+    networks_dict = get_wifi_networks(timeout, target_os=os_arg)
     current_id = networks_dict.get('current')
     if not networks_dict:
         print(f"{Fore.RED}No WiFi networks found.{Style.RESET_ALL}")
