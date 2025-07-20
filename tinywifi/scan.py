@@ -92,7 +92,7 @@ def get_wifi_networks(timeout=5, target_os="macos"):
                     iwlist_match = None
                     for iwlist_net in networks_detailed:
                         if (iwlist_net['ssid'] == nmcli_net['ssid'] and 
-                            abs(int(iwlist_net['freq']) - int(nmcli_net['freq'])) < 10):  # Allow small freq differences
+                            abs(int(float(iwlist_net['freq'])) - int(float(nmcli_net['freq']))) < 10):  # Allow small freq differences
                             iwlist_match = iwlist_net
                             break
                     
@@ -815,7 +815,10 @@ def _get_linux_iw_networks(interface):
                     
             elif line.startswith("freq:"):
                 freq_str = line.split(":")[1].strip()
-                current_net['freq'] = freq_str
+                try:
+                    current_net['freq'] = str(int(float(freq_str)))  # Convert to integer MHz
+                except ValueError:
+                    current_net['freq'] = freq_str
                 
             elif line.startswith("signal:"):
                 # Extract signal strength
