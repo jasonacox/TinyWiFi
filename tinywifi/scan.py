@@ -18,6 +18,7 @@ import re
 import subprocess
 import time
 import platform
+import os
 
 from colorama import Fore, Style, init
 
@@ -35,7 +36,7 @@ def get_wifi_networks(timeout=5, os="macos"):
     scans = max(1, timeout // 2)
     connected_unique_id = None
     if os == "macos":
-        # macOS logic
+        # macOS logic using system_profiler SPAirPortDataType
         for i in range(scans):
             try:
                 result = subprocess.run(
@@ -44,127 +45,35 @@ def get_wifi_networks(timeout=5, os="macos"):
                     text=True,
                     check=True,
                 )
-                networks = []
-                in_other_networks = False
-                ssid = None
-                channel = None
-                signal = None
-                noise = None
-                freq = None
-                mode = None
-                security = None
-                rate = None
-                for line in result.stdout.splitlines():
-                    line = line.rstrip()
-                    if "Other Local Wi-Fi Networks:" in line:
-                        in_other_networks = True
-                        continue
-                    if in_other_networks:
-                        if not line.strip():
-                            ssid = channel = signal = noise = freq = mode = security = None
-                            continue
-                        if not line.startswith(" " * 14):
-                            # New SSID
-                            ssid = line.strip().rstrip(":")
-                        elif "Channel:" in line:
-                            channel = line.split(":", 1)[1].strip().split(" ")[0]
-                        elif "Signal / Noise:" in line:
-                            sig_noise = line.split(":", 1)[1].strip().split("/")
-                            signal = sig_noise[0].strip().replace(" dBm", "")
-                            if len(sig_noise) > 1:
-                                noise = sig_noise[1].strip().replace(" dBm", "")
-                        elif "Security:" in line:
-                            security = line.split(":", 1)[1].strip()
-                        elif "Network Type:" in line:
-                            mode = line.split(":", 1)[1].strip()
-                            # abbreviate Infrastructure to Infra
-                            if mode.startswith("Infrastructure"):
-                                mode = "Infra"
-                        elif "Transmit Rate:" in line:
-                            rate = line.split(":", 1)[1].strip()
-                        elif "(2GHz" in line or "(5GHz" in line:
-                            freq_match = re.search(r"\((\d+)GHz", line)
-                            if freq_match:
-                                ghz = int(freq_match.group(1))
-                                if channel:
-                                    try:
-                                        ch = int(channel)
-                                        freq = 2407 + ch * 5 if ghz == 2 else 5000 + ch * 5
-                                    except Exception:
-                                        freq = None
-                        if ssid and signal and (channel or freq):
-                            if not channel and freq:
-                                channel = freq_to_channel(freq)
-                            freq_val = channel_to_freq(channel) if channel else freq
-                            band = (
-                                "2.4GHz"
-                                if channel and channel.isdigit() and 1 <= int(channel) <= 14
-                                else "5GHz"
-                            )
-                            # Compute signal percentage (like nmcli):
-                            try:
-                                sig_dbm = int(signal)
-                                noise_dbm = int(noise) if noise is not None else -100
-                                # nmcli uses RSSI, but we can estimate percentage:
-                                # signal_percent = min(100, max(0, 2 * (sig_dbm + 100)))
-                                # Instead, use SNR if available:
-                                snr = sig_dbm - noise_dbm
-                                signal_percent = min(100, max(0, int((snr + 100) * 0.5)))
-                            except Exception:
-                                signal_percent = 0
-                            networks.append(
-                                {
-                                    "ssid": ssid,
-                                    "rssi": sig_dbm if 'sig_dbm' in locals() else -100,
-                                    "signal": signal_percent,
-                                    "channel": channel if channel else "Unknown",
-                                    "freq": freq_val if freq_val else "Unknown",
-                                    "band": band,
-                                    "mode": mode if mode else "Unknown",
-                                    "rate": rate if rate else "Unknown",
-                                    "security": security if security else "Unknown",
-                                }
-                            )
-                            ssid = channel = signal = noise = freq = mode = security = rate = None
-                    # End parsing if we hit another section
-                    if in_other_networks and (
-                        line.strip().endswith("Networks:") and not line.strip().startswith("Other")
-                    ):
-                        break
+                
+                # Parse networks from system_profiler output
+                networks = _parse_macos_networks(result.stdout)
+                
+                # Add networks to our collection
                 for net in networks:
                     unique_id = f"{net['ssid']}_{net['freq']}"
                     all_networks[unique_id] = net
-                # Only on first scan, parse connected SSID/channel
+                
+                # Only on first scan, find the currently connected network
                 if i == 0:
-                    in_current = False
-                    ssid = None
-                    channel = None
-                    for line in result.stdout.splitlines():
-                        if "Current Network Information:" in line:
-                            in_current = True
-                            continue
-                        if in_current:
-                            line = line.strip()
-                            if line.endswith(":") and not line.startswith("PHY Mode"):
-                                ssid = line[:-1]
-                            if "Channel:" in line:
-                                channel = line.split(":", 1)[1].strip().split(" ")[0]
-                            if ssid and channel:
-                                freq = channel_to_freq(channel)
-                                connected_unique_id = f"{ssid}_{freq}"
-                                in_current = False  # Unset after recording
-                            if line == "":
-                                break
+                    connected_unique_id = _parse_macos_connected_network(result.stdout)
+                    
+                    # Also try to extract rate information for the connected network
+                    if connected_unique_id and connected_unique_id in all_networks:
+                        rate_info = _extract_connected_rate(result.stdout)
+                        if rate_info:
+                            all_networks[connected_unique_id]['rate'] = rate_info + " Mbps"
+                    
             except Exception as e:
                 print(f"{Fore.RED}Error scanning WiFi: {e}{Style.RESET_ALL}")
+            
             if i < scans - 1:
                 time.sleep(2)
+                
         all_networks['current'] = connected_unique_id
         return all_networks
     elif os == "linux":
         # Linux logic using nmcli
-        import os
-        import codecs
         connected_unique_id = None
         for i in range(scans):
             try:
@@ -180,7 +89,6 @@ def get_wifi_networks(timeout=5, os="macos"):
                     text=True,
                     check=True,
                 )
-                import re
                 for line in scan_result.stdout.splitlines():
                     # nmcli escapes colons in BSSID and other fields as \:
                     # Split only on unescaped colons
@@ -372,13 +280,16 @@ def channel_to_freq(channel):
     try:
         ch = int(channel)
         if 1 <= ch <= 14:
-            # 2.4 GHz band
-            return 2407 + ch * 5
+            # 2.4 GHz band - more accurate calculation
+            if ch == 14:
+                return 2484  # Special case for channel 14
+            else:
+                return 2412 + (ch - 1) * 5
         elif 36 <= ch <= 64:
             # 5 GHz lower band
             return 5000 + ch * 5
         elif 100 <= ch <= 144:
-            # 5 GHz middle band
+            # 5 GHz middle band (DFS channels)
             return 5000 + ch * 5
         elif 149 <= ch <= 165:
             # 5 GHz upper band
@@ -388,7 +299,6 @@ def channel_to_freq(channel):
     except Exception:
         return "Unknown"
 
-
 def print_table(networks_dict, current_id=None):
     """
     Print a colorized table of WiFi networks.
@@ -396,56 +306,337 @@ def print_table(networks_dict, current_id=None):
         networks_dict (dict): Dictionary of network info keyed by unique_id.
         current_id (str): Unique ID of the currently connected SSID.
     """
-    if not networks_dict:
+    if not networks_dict or all(k == 'current' for k in networks_dict):
         print(f"{Fore.RED}No WiFi networks found.{Style.RESET_ALL}")
         return
 
-    # Print unified header for all platforms
-    print(f"{Fore.CYAN}{'SSID':<24} {'BSSID':<18} {'Signal':<14} {'Freq':<8} {'Channel':<8} {'Band':<7} {'Mode':<7} {'Rate':<10} {'Security':<12} {'State':<8}{Style.RESET_ALL}")
-
     # Sort by best signal (highest RSSI)
-    ssid_list = [k for k in networks_dict.keys() if k != 'current']
-    ssid_list.sort(key=lambda k: networks_dict[k].get('rssi', -100), reverse=True)
+    ssid_list = sorted(
+        [k for k in networks_dict.keys() if k != 'current'],
+        key=lambda k: networks_dict[k].get('rssi', -100), 
+        reverse=True
+    )
 
-    import platform
-    sys_os = platform.system().lower()
+    # Check if optional data is available
+    show_bssid = any(networks_dict[k].get('bssid', '') for k in ssid_list)
+    show_noise = any(networks_dict[k].get('noise') is not None and networks_dict[k].get('noise') != -100 for k in ssid_list)
+    show_snr = any(networks_dict[k].get('snr') is not None for k in ssid_list)
+
+    # Build header based on available data
+    header_parts = [('SSID', 24)]
+    if show_bssid:
+        header_parts.append(('BSSID', 18))
+    header_parts.append(('Signal', 14))
+    if show_noise:
+        header_parts.append(('Noise', 8))
+    if show_snr:
+        header_parts.append(('SNR', 8))
+    header_parts.extend([
+        ('Freq', 8),
+        ('Channel', 8),
+        ('Band', 7),
+        ('Mode', 7),
+        ('Rate', 10),
+        ('Security', 12),
+        ('State', 8)
+    ])
+    
+    # Print the header
+    header_str = "".join(f"{name:<{width}} " for name, width in header_parts)
+    print(f"{Fore.CYAN}{header_str.rstrip()}{Style.RESET_ALL}")
+
     for unique_id in ssid_list:
         net = networks_dict[unique_id]
         signal_val = net.get('signal')
         rssi = net.get('rssi', -100)
-        # Compose signal display: show % for Linux, % + dB for macOS
-        if signal_val is not None and isinstance(signal_val, int) and 0 <= signal_val <= 100:
-            color = (
-                Fore.GREEN if signal_val > 60 else (Fore.YELLOW if signal_val > 40 else Fore.RED)
-            )
-            if sys_os == "linux":
-                signal_display = f"{signal_val}%"
-            else:
-                signal_display = f"{signal_val}% ({rssi} dB)"
+        
+        # Determine signal color based on strength
+        # 	Signal strength: -58 dBm → Strong. (Closer to 0 is better; -30 is excellent, -60 is good, -70 is fair.)
+	    #   Noise level: -89 dBm → Low interference. (More negative is better.)
+	    #   SNR (Signal-to-Noise Ratio): 31 dB → Very good connection.
+        if (signal_val is not None and signal_val >= 65) or rssi > -60:
+            color = Fore.GREEN
+        elif (signal_val is not None and signal_val >= 60) or (-66 < rssi <= -60):
+            color = Fore.YELLOW
         else:
-            color = (
-                Fore.GREEN if rssi > -60 else (Fore.YELLOW if rssi > -80 else Fore.RED)
-            )
-            signal_display = f"{rssi} dB"
-        band_color = (
-            Fore.LIGHTGREEN_EX if net.get("band", "") == "2.4GHz" else Fore.LIGHTMAGENTA_EX
+            color = Fore.RED
+            
+        # Format signal display
+        signal_display = (
+            f"{signal_val}% ({rssi} dB)" if signal_val is not None and rssi else
+            f"{signal_val}%" if signal_val is not None else
+            f"{rssi} dB"
         )
+        
+        # Format other fields
         ssid_raw = net.get('ssid', '')
-        ssid_display = ssid_raw if len(ssid_raw) <= 24 else ssid_raw[:21] + '...'
-        current = "Connected" if unique_id == current_id else ""
-        # Abbreviate security by removing 'Personal' suffix
+        ssid_display = ssid_raw[:21] + '...' if len(ssid_raw) > 24 else ssid_raw
+        ssid_color = Fore.GREEN if unique_id == current_id else Fore.WHITE
+        
         security_val = net.get('security', '')
         if security_val.endswith('Personal'):
             security_val = security_val.replace('Personal', '').strip()
-        print(
-            f"{Fore.WHITE}{ssid_display:<24} "
-            f"{Fore.LIGHTBLACK_EX}{net.get('bssid',''):<18} "
-            f"{color}{signal_display:<14} "
-            f"{Fore.BLUE}{net.get('freq',''):<8} "
-            f"{Fore.MAGENTA}{net.get('channel',''):<8} "
-            f"{band_color}{net.get('band',''):<7} "
-            f"{Fore.CYAN}{net.get('mode',''):<7} "
-            f"{Fore.YELLOW}{net.get('rate',''):<10} "
-            f"{Fore.LIGHTWHITE_EX}{security_val:<12} "
-            f"{Fore.GREEN}{current:<8}{Style.RESET_ALL}"
-        )
+        security_val = security_val[:12]
+        
+        band_color = Fore.LIGHTGREEN_EX if net.get("band") == "2.4GHz" else Fore.LIGHTMAGENTA_EX
+        current = "Connected" if unique_id == current_id else ""
+        
+        # Format noise and SNR if available
+        noise_val = net.get('noise')
+        snr_val = net.get('snr')
+        
+        if noise_val is not None and noise_val != -100:
+            noise_display = f"{noise_val} dB"
+            noise_color = Fore.LIGHTBLACK_EX
+        else:
+            noise_display = "--"
+            noise_color = Fore.LIGHTBLACK_EX
+            
+        if snr_val is not None:
+            snr_display = f"{snr_val} dB"
+            # Color SNR based on quality: >25 excellent, 15-25 good, <15 poor
+            if snr_val > 25:
+                snr_color = Fore.GREEN
+            elif snr_val >= 15:
+                snr_color = Fore.YELLOW
+            else:
+                snr_color = Fore.RED
+        else:
+            snr_display = "--"
+            snr_color = Fore.LIGHTBLACK_EX
+        
+        # Build the row based on available data
+        row_parts = [(ssid_color, ssid_display, 24)]
+        if show_bssid:
+            row_parts.append((Fore.LIGHTBLACK_EX, net.get('bssid',''), 18))
+        row_parts.append((color, signal_display, 14))
+        if show_noise:
+            row_parts.append((noise_color, noise_display, 8))
+        if show_snr:
+            row_parts.append((snr_color, snr_display, 8))
+        row_parts.extend([
+            (Fore.BLUE, str(net.get('freq','')), 8),
+            (Fore.MAGENTA, str(net.get('channel','')), 8),
+            (band_color, net.get('band',''), 7),
+            (Fore.CYAN, net.get('mode',''), 7),
+            (Fore.YELLOW, net.get('rate',''), 10),
+            (Fore.LIGHTWHITE_EX, security_val, 12),
+            (Fore.GREEN, current, 8)
+        ])
+        
+        # Print the row
+        row_str = "".join(f"{color}{value:<{width}} " for color, value, width in row_parts)
+        print(f"{row_str.rstrip()}{Style.RESET_ALL}")
+
+
+def _parse_macos_networks(output):
+    """
+    Parse networks from the 'Other Local Wi-Fi Networks' section of system_profiler output.
+    
+    Args:
+        output (str): Raw output from system_profiler SPAirPortDataType
+        
+    Returns:
+        List[dict]: List of network dictionaries
+    """
+    networks = []
+    lines = output.splitlines()
+    
+    # Find the start of "Other Local Wi-Fi Networks" section
+    in_networks_section = False
+    current_network = {}
+    
+    for line in lines:
+        line = line.rstrip()
+        
+        if "Other Local Wi-Fi Networks:" in line:
+            in_networks_section = True
+            continue
+            
+        if not in_networks_section:
+            continue
+            
+        # Stop if we hit another major section
+        if line and not line.startswith(" ") and ":" in line and not line.startswith("            "):
+            break
+            
+        # Empty line or new network starts
+        if not line.strip():
+            if current_network and current_network.get('ssid'):
+                networks.append(_finalize_network(current_network))
+            current_network = {}
+            continue
+            
+        # Network name (SSID) - starts at column 12, ends with ":"
+        if line.startswith("            ") and not line.startswith("              ") and line.endswith(":"):
+            if current_network and current_network.get('ssid'):
+                networks.append(_finalize_network(current_network))
+            current_network = {'ssid': line.strip()[:-1]}  # Remove the trailing ":"
+            continue
+            
+        # Network properties - indented further
+        if line.startswith("              ") and ":" in line:
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            
+            if key == "Channel":
+                # Extract channel number and frequency band
+                channel_match = re.search(r"(\d+)\s*\((\d+)GHz", value)
+                if channel_match:
+                    current_network['channel'] = channel_match.group(1)
+                    ghz = int(channel_match.group(2))
+                    current_network['freq'] = channel_to_freq(current_network['channel'])
+                    current_network['band'] = f"{ghz}GHz" if ghz in [2, 5] else "Unknown"
+                    
+            elif key == "Signal / Noise":
+                # Extract signal and noise values
+                sig_noise = value.split("/")
+                if len(sig_noise) >= 1:
+                    signal_str = sig_noise[0].strip().replace(" dBm", "")
+                    try:
+                        current_network['rssi'] = int(signal_str)
+                    except ValueError:
+                        current_network['rssi'] = -100
+                        
+                if len(sig_noise) >= 2:
+                    noise_str = sig_noise[1].strip().replace(" dBm", "")
+                    try:
+                        current_network['noise'] = int(noise_str)
+                    except ValueError:
+                        current_network['noise'] = -100
+                        
+            elif key == "Security":
+                current_network['security'] = value
+                
+            elif key == "Network Type":
+                current_network['mode'] = "Infra" if value.startswith("Infrastructure") else value
+                
+            elif key == "Transmit Rate":
+                current_network['rate'] = value
+                
+    # Don't forget the last network
+    if current_network and current_network.get('ssid'):
+        networks.append(_finalize_network(current_network))
+        
+    return networks
+
+
+def _parse_macos_connected_network(output):
+    """
+    Parse the currently connected network from system_profiler output.
+    
+    Args:
+        output (str): Raw output from system_profiler SPAirPortDataType
+        
+    Returns:
+        str or None: Unique ID of connected network (ssid_freq) or None
+    """
+    lines = output.splitlines()
+    in_current_section = False
+    ssid = None
+    channel = None
+    
+    for line in lines:
+        line = line.strip()
+        
+        if "Current Network Information:" in line:
+            in_current_section = True
+            continue
+            
+        if not in_current_section:
+            continue
+            
+        # Stop if we hit "Other Local Wi-Fi Networks:" or empty line after getting data
+        if "Other Local Wi-Fi Networks:" in line or (not line and ssid and channel):
+            break
+            
+        # SSID is the first line after "Current Network Information:" that ends with ":"
+        if line.endswith(":") and not any(x in line for x in ["PHY Mode", "Channel", "Country", "Network", "Security", "Signal", "Transmit", "MCS"]):
+            ssid = line[:-1]  # Remove trailing ":"
+            
+        elif line.startswith("Channel:"):
+            channel_info = line.split(":", 1)[1].strip()
+            channel_match = re.search(r"(\d+)", channel_info)
+            if channel_match:
+                channel = channel_match.group(1)
+                
+        # Once we have both SSID and channel, we can create the unique ID
+        if ssid and channel:
+            freq = channel_to_freq(channel)
+            return f"{ssid}_{freq}"
+            
+    return None
+
+
+def _extract_connected_rate(output):
+    """
+    Extract the transmit rate from the current network information section.
+    
+    Args:
+        output (str): Raw output from system_profiler SPAirPortDataType
+        
+    Returns:
+        str or None: Transmit rate or None if not found
+    """
+    lines = output.splitlines()
+    in_current_section = False
+    
+    for line in lines:
+        line = line.strip()
+        
+        if "Current Network Information:" in line:
+            in_current_section = True
+            continue
+            
+        if not in_current_section:
+            continue
+            
+        # Stop if we hit "Other Local Wi-Fi Networks:" 
+        if "Other Local Wi-Fi Networks:" in line:
+            break
+            
+        if line.startswith("Transmit Rate:"):
+            rate_info = line.split(":", 1)[1].strip()
+            return rate_info
+            
+    return None
+
+
+def _finalize_network(network_dict):
+    """
+    Finalize a network dictionary with calculated fields and defaults.
+    
+    Args:
+        network_dict (dict): Partial network dictionary
+        
+    Returns:
+        dict: Complete network dictionary
+    """
+    # Calculate signal percentage from RSSI and noise if available
+    rssi = network_dict.get('rssi', -100)
+    noise = network_dict.get('noise', -100)
+    snr = None
+    
+    if rssi != -100 and noise != -100:
+        snr = rssi - noise
+        signal_percent = min(100, max(0, int((snr + 100) * 0.5)))
+    else:
+        # Fallback: simple RSSI to percentage conversion
+        signal_percent = min(100, max(0, 2 * (rssi + 100)))
+        
+    # Set defaults for missing fields
+    return {
+        'ssid': network_dict.get('ssid', 'Unknown'),
+        'bssid': network_dict.get('bssid', ''),  # macOS doesn't provide BSSID in system_profiler
+        'rssi': rssi,
+        'signal': signal_percent,
+        'noise': network_dict.get('noise', None),
+        'snr': snr,
+        'channel': network_dict.get('channel', '--'),
+        'freq': network_dict.get('freq', '--'),
+        'band': network_dict.get('band', 'Unknown'),
+        'mode': network_dict.get('mode', '--'),
+        'rate': network_dict.get('rate', '--'),
+        'security': network_dict.get('security', '--'),
+    }
