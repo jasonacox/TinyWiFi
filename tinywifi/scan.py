@@ -65,7 +65,7 @@ def get_wifi_networks(timeout=5, target_os="macos"):
                         if rate_info:
                             all_networks[connected_unique_id]['rate'] = rate_info + " Mbps"
                     
-            except Exception as e:
+            except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
                 print(f"{Fore.RED}Error scanning WiFi: {e}{Style.RESET_ALL}")
             
             if i < scans - 1:
@@ -74,65 +74,51 @@ def get_wifi_networks(timeout=5, target_os="macos"):
         all_networks['current'] = connected_unique_id
         return all_networks
     elif target_os == "linux":
-        # Linux logic using nmcli
+        # Linux logic using multiple tools for comprehensive data
         connected_unique_id = None
         for i in range(scans):
             try:
-                # Check for root privileges
-                is_root = (os.geteuid() == 0)
-                nmcli_cmd = ["nmcli", "-t", "-f", "ACTIVE,SSID,BSSID,SIGNAL,CHAN,FREQ,MODE,RATE,SECURITY", "device", "wifi", "list"]
-                if not is_root:
-                    print(f"{Fore.YELLOW}Warning: Scanning all WiFi SSIDs may require root privileges. Retrying with sudo...{Style.RESET_ALL}")
-                    nmcli_cmd = ["sudo"] + nmcli_cmd
-                scan_result = subprocess.run(
-                    nmcli_cmd,
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
-                print(f"nmcli output: {scan_result.stdout[:200]}...")  # Debug output
-                for line in scan_result.stdout.splitlines():
-                    # nmcli escapes colons in BSSID and other fields as \:
-                    # Split only on unescaped colons
-                    fields = re.split(r'(?<!\\):', line.strip())
-                    # Unescape colons in fields
-                    fields = [f.replace('\\:', ':').replace('\\', '') for f in fields]
-                    if len(fields) >= 9:
-                        active = fields[0].strip()
-                        ssid = fields[1].strip()
-                        if not ssid:
-                            ssid = "<hidden>"  # empty SSID
-                        bssid = fields[2].strip()
-                        signal = int(fields[3]) if fields[3].isdigit() else -100
-                        channel = fields[4].strip()
-                        freq = fields[5].replace(" MHz","").strip()
-                        mode = fields[6].strip()
-                        rate = fields[7].strip()
-                        security = fields[8].strip()
-                        band = "2.4GHz" if freq and freq.startswith("2") else "5GHz"
+                # First try iwlist for detailed signal information
+                networks_detailed = _get_linux_iwlist_networks()
+                
+                # Then get nmcli data for additional info and active connections
+                networks_nmcli = _get_linux_nmcli_networks()
+                
+                # Merge the data sources
+                for nmcli_net in networks_nmcli:
+                    unique_id = f"{nmcli_net['ssid']}_{nmcli_net['freq']}"
+                    
+                    # Look for matching network in iwlist data for enhanced signal info
+                    iwlist_match = None
+                    for iwlist_net in networks_detailed:
+                        if (iwlist_net['ssid'] == nmcli_net['ssid'] and 
+                            abs(int(iwlist_net['freq']) - int(nmcli_net['freq'])) < 10):  # Allow small freq differences
+                            iwlist_match = iwlist_net
+                            break
+                    
+                    # Combine data from both sources
+                    combined_net = nmcli_net.copy()
+                    if iwlist_match:
+                        # Use iwlist data for signal, noise if available
+                        if iwlist_match.get('rssi') != -100:
+                            combined_net['rssi'] = iwlist_match['rssi']
+                        if iwlist_match.get('noise') is not None:
+                            combined_net['noise'] = iwlist_match['noise']
+                        if iwlist_match.get('snr') is not None:
+                            combined_net['snr'] = iwlist_match['snr']
+                    
+                    all_networks[unique_id] = combined_net
+                    
+                    # Check if this is the active connection
+                    if nmcli_net.get('active'):
+                        connected_unique_id = unique_id
                         
-                        # Calculate signal percentage for Linux (nmcli gives percentage directly)
-                        signal_percent = signal if signal > 0 else 0
-                        
-                        unique_id = f"{ssid}_{freq}"
-                        all_networks[unique_id] = {
-                            "ssid": ssid,
-                            "bssid": bssid,
-                            "rssi": signal,
-                            "signal": signal_percent,
-                            "channel": channel,
-                            "freq": freq,
-                            "band": band,
-                            "mode": mode,
-                            "rate": rate,
-                            "security": security,
-                        }
-                        if active == "yes":
-                            connected_unique_id = unique_id
-            except Exception as e:
+            except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
                 print(f"{Fore.RED}Error scanning WiFi: {e}{Style.RESET_ALL}")
+            
             if i < scans - 1:
                 time.sleep(2)
+                
         all_networks['current'] = connected_unique_id
         return all_networks
     elif target_os == "windows":
@@ -227,7 +213,7 @@ def parse_system_profiler_output(output):
                         try:
                             ch = int(channel)
                             freq = 2407 + ch * 5 if ghz == 2 else 5000 + ch * 5
-                        except Exception:
+                        except (ValueError, TypeError):
                             freq = None
             if ssid and signal and (channel or freq):
                 if not channel and freq:
@@ -272,7 +258,7 @@ def freq_to_channel(freq):
             return str((freq - 5000) // 5)
         else:
             return "Unknown"
-    except Exception:
+    except (ValueError, TypeError):
         return "Unknown"
 
 
@@ -303,7 +289,7 @@ def channel_to_freq(channel):
             return 5000 + ch * 5
         else:
             return "Unknown"
-    except Exception:
+    except (ValueError, TypeError):
         return "Unknown"
 
 def print_table(networks_dict, current_id=None):
@@ -647,3 +633,179 @@ def _finalize_network(network_dict):
         'rate': network_dict.get('rate', '--'),
         'security': network_dict.get('security', '--'),
     }
+
+
+def _get_linux_iwlist_networks():
+    """
+    Get WiFi networks using iwlist scan for detailed signal information.
+    
+    Returns:
+        List[dict]: List of network dictionaries with signal/noise data
+    """
+    networks = []
+    try:
+        # Try to find wireless interface
+        result = subprocess.run(
+            ["iwconfig"], 
+            capture_output=True, 
+            text=True, 
+            check=False
+        )
+        
+        # Find wireless interface name
+        interface = None
+        for line in result.stdout.splitlines():
+            if "IEEE 802.11" in line or "ESSID:" in line:
+                interface = line.split()[0]
+                break
+        
+        if not interface:
+            return networks
+            
+        # Run iwlist scan
+        scan_cmd = ["iwlist", interface, "scan"]
+        try:
+            scan_result = subprocess.run(scan_cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError:
+            # Try with sudo if permission denied
+            scan_cmd = ["sudo"] + scan_cmd
+            scan_result = subprocess.run(scan_cmd, capture_output=True, text=True, check=True)
+        
+        # Parse iwlist output
+        current_net = {}
+        for line in scan_result.stdout.splitlines():
+            line = line.strip()
+            
+            if line.startswith("Cell "):
+                # New network entry
+                if current_net and current_net.get('ssid'):
+                    networks.append(current_net)
+                current_net = {}
+                
+                # Extract BSSID and frequency from Cell line
+                parts = line.split()
+                for i, part in enumerate(parts):
+                    if part == "Address:" and i + 1 < len(parts):
+                        current_net['bssid'] = parts[i + 1]
+                    elif part == "Frequency:" and i + 1 < len(parts):
+                        freq_str = parts[i + 1]
+                        if freq_str.endswith("GHz"):
+                            freq_ghz = float(freq_str[:-3])
+                            current_net['freq'] = str(int(freq_ghz * 1000))  # Convert to MHz
+            
+            elif line.startswith("Channel:"):
+                current_net['channel'] = line.split(":")[1].strip()
+                
+            elif line.startswith("Quality="):
+                # Extract signal and noise from Quality line
+                # Example: Quality=70/70  Signal level=-40 dBm  Noise level=-89 dBm
+                if "Signal level=" in line:
+                    signal_part = line.split("Signal level=")[1].split()[0]
+                    if signal_part.endswith(" dBm"):
+                        signal_part = signal_part[:-4]
+                    try:
+                        current_net['rssi'] = int(signal_part)
+                    except ValueError:
+                        current_net['rssi'] = -100
+                        
+                if "Noise level=" in line:
+                    noise_part = line.split("Noise level=")[1].split()[0]
+                    if noise_part.endswith(" dBm"):
+                        noise_part = noise_part[:-4]
+                    try:
+                        noise_val = int(noise_part)
+                        current_net['noise'] = noise_val
+                        
+                        # Calculate SNR if we have both signal and noise
+                        if current_net.get('rssi') and current_net['rssi'] != -100:
+                            current_net['snr'] = current_net['rssi'] - noise_val
+                    except ValueError:
+                        pass
+                        
+            elif line.startswith("ESSID:"):
+                essid = line.split(":", 1)[1].strip().strip('"')
+                if essid and essid != "<hidden>":
+                    current_net['ssid'] = essid
+                    
+            elif line.startswith("Mode:"):
+                mode = line.split(":", 1)[1].strip()
+                current_net['mode'] = "Infra" if mode == "Master" else mode
+                
+            elif "Encryption key:" in line:
+                if "off" in line.lower():
+                    current_net['security'] = "None"
+                else:
+                    current_net['security'] = "WPA/WPA2"  # Default assumption
+        
+        # Don't forget the last network
+        if current_net and current_net.get('ssid'):
+            networks.append(current_net)
+            
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError, ValueError):
+        # If iwlist fails, return empty list (we'll fall back to nmcli only)
+        pass
+        
+    return networks
+
+
+def _get_linux_nmcli_networks():
+    """
+    Get WiFi networks using nmcli for connection and basic info.
+    
+    Returns:
+        List[dict]: List of network dictionaries from nmcli
+    """
+    networks = []
+    try:
+        # Check for root privileges
+        is_root = (os.geteuid() == 0)
+        nmcli_cmd = ["nmcli", "-t", "-f", "ACTIVE,SSID,BSSID,SIGNAL,CHAN,FREQ,MODE,RATE,SECURITY", "device", "wifi", "list"]
+        if not is_root:
+            try:
+                scan_result = subprocess.run(nmcli_cmd, capture_output=True, text=True, check=True)
+            except subprocess.CalledProcessError:
+                # Try with sudo if permission denied
+                nmcli_cmd = ["sudo"] + nmcli_cmd
+                scan_result = subprocess.run(nmcli_cmd, capture_output=True, text=True, check=True)
+        else:
+            scan_result = subprocess.run(nmcli_cmd, capture_output=True, text=True, check=True)
+        
+        for line in scan_result.stdout.splitlines():
+            # nmcli escapes colons in BSSID and other fields as \:
+            # Split only on unescaped colons
+            fields = re.split(r'(?<!\\):', line.strip())
+            # Unescape colons in fields
+            fields = [f.replace('\\:', ':').replace('\\', '') for f in fields]
+            if len(fields) >= 9:
+                active = fields[0].strip()
+                ssid = fields[1].strip()
+                if not ssid:
+                    ssid = "<hidden>"  # empty SSID
+                bssid = fields[2].strip()
+                signal_percent = int(fields[3]) if fields[3].isdigit() else 0
+                channel = fields[4].strip()
+                freq = fields[5].replace(" MHz","").strip()
+                mode = fields[6].strip()
+                rate = fields[7].strip()
+                security = fields[8].strip()
+                band = "2.4GHz" if freq and freq.startswith("2") else "5GHz"
+                
+                networks.append({
+                    "ssid": ssid,
+                    "bssid": bssid,
+                    "rssi": -100,  # Will be overwritten by iwlist if available
+                    "signal": signal_percent,
+                    "channel": channel,
+                    "freq": freq,
+                    "band": band,
+                    "mode": mode,
+                    "rate": rate,
+                    "security": security,
+                    "active": (active == "yes"),
+                })
+                
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError, ValueError):
+        # If nmcli fails, return empty list
+        pass
+        
+    return networks
