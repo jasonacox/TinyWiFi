@@ -354,12 +354,16 @@ def print_table(networks_dict, current_id=None):
         else:
             color = Fore.RED
             
-        # Format signal display
-        signal_display = (
-            f"{signal_val}% ({rssi} dB)" if signal_val is not None and rssi else
-            f"{signal_val}%" if signal_val is not None else
-            f"{rssi} dB"
-        )
+        # Format signal display - only show dBm if we have real values
+        if rssi != -100:
+            if signal_val is not None:
+                signal_display = f"{signal_val}% ({rssi} dB)"
+            else:
+                signal_display = f"{rssi} dB"
+        elif signal_val is not None:
+            signal_display = f"{signal_val}%"
+        else:
+            signal_display = "--"
         
         # Format other fields
         ssid_raw = net.get('ssid', '')
@@ -661,8 +665,13 @@ def _get_linux_iwlist_networks():
         
         if not interface:
             return networks
+        
+        # Try iw scan first (newer and more reliable)
+        networks_iw = _get_linux_iw_networks(interface)
+        if networks_iw:
+            return networks_iw
             
-        # Run iwlist scan
+        # Fallback to iwlist scan
         scan_cmd = ["iwlist", interface, "scan"]
         try:
             scan_result = subprocess.run(scan_cmd, capture_output=True, text=True, check=True)
@@ -696,31 +705,43 @@ def _get_linux_iwlist_networks():
             elif line.startswith("Channel:"):
                 current_net['channel'] = line.split(":")[1].strip()
                 
-            elif line.startswith("Quality="):
-                # Extract signal and noise from Quality line
-                # Example: Quality=70/70  Signal level=-40 dBm  Noise level=-89 dBm
+            elif line.startswith("Quality=") or "Signal level=" in line:
+                # More comprehensive signal parsing
+                # Examples:
+                # Quality=70/70  Signal level=-40 dBm  Noise level=-89 dBm
+                # Quality=5/5  Signal level=1 dBm
+                # Signal level=-42 dBm
+                
                 if "Signal level=" in line:
-                    signal_part = line.split("Signal level=")[1].split()[0]
-                    if signal_part.endswith(" dBm"):
-                        signal_part = signal_part[:-4]
-                    try:
-                        current_net['rssi'] = int(signal_part)
-                    except ValueError:
-                        current_net['rssi'] = -100
+                    # Extract signal strength
+                    signal_match = re.search(r"Signal level=(-?\d+(?:\.\d+)?)\s*dBm", line)
+                    if signal_match:
+                        try:
+                            current_net['rssi'] = int(float(signal_match.group(1)))
+                        except ValueError:
+                            current_net['rssi'] = -100
+                    else:
+                        # Try alternative format: Signal level=-42 dBm
+                        signal_match = re.search(r"Signal level=(-?\d+)", line)
+                        if signal_match:
+                            try:
+                                current_net['rssi'] = int(signal_match.group(1))
+                            except ValueError:
+                                current_net['rssi'] = -100
                         
                 if "Noise level=" in line:
-                    noise_part = line.split("Noise level=")[1].split()[0]
-                    if noise_part.endswith(" dBm"):
-                        noise_part = noise_part[:-4]
-                    try:
-                        noise_val = int(noise_part)
-                        current_net['noise'] = noise_val
-                        
-                        # Calculate SNR if we have both signal and noise
-                        if current_net.get('rssi') and current_net['rssi'] != -100:
-                            current_net['snr'] = current_net['rssi'] - noise_val
-                    except ValueError:
-                        pass
+                    # Extract noise floor
+                    noise_match = re.search(r"Noise level=(-?\d+(?:\.\d+)?)\s*dBm", line)
+                    if noise_match:
+                        try:
+                            noise_val = int(float(noise_match.group(1)))
+                            current_net['noise'] = noise_val
+                            
+                            # Calculate SNR if we have both signal and noise
+                            if current_net.get('rssi') and current_net['rssi'] != -100:
+                                current_net['snr'] = current_net['rssi'] - noise_val
+                        except ValueError:
+                            pass
                         
             elif line.startswith("ESSID:"):
                 essid = line.split(":", 1)[1].strip().strip('"')
@@ -743,6 +764,87 @@ def _get_linux_iwlist_networks():
             
     except (subprocess.CalledProcessError, FileNotFoundError, OSError, ValueError):
         # If iwlist fails, return empty list (we'll fall back to nmcli only)
+        pass
+        
+    return networks
+
+
+def _get_linux_iw_networks(interface):
+    """
+    Get WiFi networks using iw scan for detailed signal information.
+    
+    Args:
+        interface (str): Wireless interface name
+        
+    Returns:
+        List[dict]: List of network dictionaries with signal data
+    """
+    networks = []
+    try:
+        # Try iw scan command (more modern than iwlist)
+        scan_cmd = ["iw", "dev", interface, "scan"]
+        try:
+            scan_result = subprocess.run(scan_cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError:
+            # Try with sudo if permission denied
+            scan_cmd = ["sudo"] + scan_cmd
+            try:
+                scan_result = subprocess.run(scan_cmd, capture_output=True, text=True, check=True)
+            except subprocess.CalledProcessError:
+                return networks  # iw not available or failed
+        
+        # Parse iw scan output
+        current_net = {}
+        for line in scan_result.stdout.splitlines():
+            line = line.strip()
+            
+            if line.startswith("BSS "):
+                # New network entry
+                if current_net and current_net.get('ssid'):
+                    networks.append(current_net)
+                current_net = {}
+                
+                # Extract BSSID and frequency from BSS line
+                # Example: BSS 12:34:56:78:9a:bc(on wlan0) -- associated
+                parts = line.split()
+                if len(parts) > 1:
+                    bssid_part = parts[1]
+                    # Remove any parentheses and extra info
+                    bssid = bssid_part.split('(')[0]
+                    current_net['bssid'] = bssid
+                    
+            elif line.startswith("freq:"):
+                freq_str = line.split(":")[1].strip()
+                current_net['freq'] = freq_str
+                
+            elif line.startswith("signal:"):
+                # Extract signal strength
+                # Example: signal: -42.00 dBm
+                signal_match = re.search(r"signal:\s*(-?\d+(?:\.\d+)?)\s*dBm", line)
+                if signal_match:
+                    try:
+                        current_net['rssi'] = int(float(signal_match.group(1)))
+                    except ValueError:
+                        current_net['rssi'] = -100
+                        
+            elif line.startswith("SSID:"):
+                ssid = line.split(":", 1)[1].strip()
+                if ssid and ssid != "--":
+                    current_net['ssid'] = ssid
+                    
+            elif "capability:" in line.lower():
+                # Extract basic security info from capability
+                if "Privacy" in line:
+                    current_net['security'] = "WPA/WPA2"  # Default assumption
+                else:
+                    current_net['security'] = "None"
+        
+        # Don't forget the last network
+        if current_net and current_net.get('ssid'):
+            networks.append(current_net)
+            
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError, ValueError):
+        # If iw fails, return empty list
         pass
         
     return networks
