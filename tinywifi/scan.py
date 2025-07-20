@@ -91,10 +91,18 @@ def get_wifi_networks(timeout=5, target_os="macos"):
                     # Look for matching network in iwlist data for enhanced signal info
                     iwlist_match = None
                     for iwlist_net in networks_detailed:
-                        if (iwlist_net['ssid'] == nmcli_net['ssid'] and 
-                            abs(int(float(iwlist_net['freq'])) - int(float(nmcli_net['freq']))) < 10):  # Allow small freq differences
-                            iwlist_match = iwlist_net
-                            break
+                        try:
+                            # Convert frequencies to integers for comparison
+                            iwlist_freq = int(float(iwlist_net.get('freq', 0)))
+                            nmcli_freq = int(float(nmcli_net.get('freq', 0)))
+                            
+                            if (iwlist_net.get('ssid') == nmcli_net.get('ssid') and 
+                                abs(iwlist_freq - nmcli_freq) < 10):  # Allow small freq differences
+                                iwlist_match = iwlist_net
+                                break
+                        except (ValueError, TypeError):
+                            # Skip this comparison if frequency conversion fails
+                            continue
                     
                     # Combine data from both sources
                     combined_net = nmcli_net.copy()
